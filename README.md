@@ -1,4 +1,4 @@
-DS Mic Streamer: A tool that turns your Nintendo DS microphone into a wireless PC microphone over local Wi-Fi.
+DS Mic: A tool that turns your Nintendo DS microphone into a wireless PC microphone over local Wi-Fi.
 
 What You Need:
 - A Nintendo DS flashcart or a DS emulator that supports Wi-Fi simulation (such as MelonDS or No$GBA).
