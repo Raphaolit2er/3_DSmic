@@ -14,7 +14,6 @@ How to Run:
 4. Boot the compiled client "ds-mic-client.nds" file on your DS hardware or emulator.
 5. Press the D-pad to enter your host PC's local IP address, then type the port number using the numeric on-screen keyboard.
 6. Once connected, your DS microphone stream will stream live to your PC, showing real-time amplitude levels in the visualizer!
-7. The "Hear Self: ON/OFF" toggle is currently broken, so using it doesn't work. Use other apps like Discord instead.
 
 Disclaimers:
 - Only 1 console can be connected at a time.
