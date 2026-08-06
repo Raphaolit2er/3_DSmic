@@ -10,6 +10,7 @@ import math
 import tkinter as tk
 from tkinter import ttk, messagebox
 import pyaudio
+import queue
 
 # ── Defaults ──────────────────────────────────────────────────
 DEFAULT_PORT = 8888
@@ -22,10 +23,18 @@ current_sample_rate = 8000
 ds_address = None
 accept_thread = None
 audio_output = None
-monitor_active = False
 
 # Global variable shared with GUI for visualizer RMS level
 current_rms_level = 0.0
+
+# ── Hear-Self monitor state ──────────────────────────────────
+monitor_active = False
+monitor_p = None
+monitor_stream = None
+monitor_lock = threading.Lock()
+monitor_queue = queue.Queue(maxsize=32)
+monitor_rate = None
+monitor_consumer_thread = None
 
 # ── IP listing ────────────────────────────────────────────────
 def get_local_ips():
@@ -75,13 +84,11 @@ def get_sorted_ips():
             other.append((name, ip))
     return primary + priority + other
 
-# ── Audio Device Discovery (Canonical De-Duplication) ─────────
-# ── Audio Device Discovery (Canonical De-Duplication) ─────────
+# ── Audio Device Discovery (Virtual Only) ───────────────────
 def get_audio_devices():
     p = pyaudio.PyAudio()
     inputs = []
     outputs = []
-    
     seen_inputs = set()
     seen_outputs = set()
 
@@ -90,11 +97,8 @@ def get_audio_devices():
             dev = p.get_device_info_by_index(i)
             name = dev.get('name', 'Unknown')
             name_lower = name.lower()
-            
-            # Filter specifically for virtual pipelines
+
             if any(kw in name_lower for kw in ["cable", "virtual", "point", "voicemeeter", "sonar", "broadcast", "nintendo ds"]):
-                
-                # Fix VB-Audio names explicitly
                 if "cable input" in name_lower:
                     canonical_key = "vb_cable_input"
                     clean_name = "CABLE Input (VB-Audio Virtual Cable)"
@@ -105,25 +109,38 @@ def get_audio_devices():
                     canonical_key = "vb_audio_point"
                     clean_name = name
                 else:
-                    # Keep the full name for Nvidia Broadcast, Sonar, etc.
                     clean_name = name
-                    # Match by the first 25 chars so Windows truncations merge together perfectly
-                    canonical_key = name_lower[:25] 
-                
-                # Register Outputs 
+                    canonical_key = name_lower[:25]
+
                 if dev.get('maxOutputChannels', 0) > 0 and canonical_key not in seen_outputs:
                     seen_outputs.add(canonical_key)
                     outputs.append((i, clean_name))
-                    
-                # Register Inputs 
+
                 if dev.get('maxInputChannels', 0) > 0 and canonical_key not in seen_inputs:
                     seen_inputs.add(canonical_key)
                     inputs.append((i, clean_name))
         except Exception:
             pass
-            
+
     p.terminate()
     return inputs, outputs
+
+# ── Simple linear PCM resampler ───────────────────────────────
+def resample_linear(pcm_bytes, src_rate, dst_rate):
+    if src_rate == dst_rate:
+        return pcm_bytes
+    samples = struct.unpack(f">{len(pcm_bytes)//2}h", pcm_bytes)
+    ratio = dst_rate / src_rate
+    new_len = max(1, int(len(samples) * ratio))
+    new_samples = []
+    for i in range(new_len):
+        src_pos = i / ratio
+        i0 = int(src_pos)
+        i1 = min(i0 + 1, len(samples) - 1)
+        frac = src_pos - i0
+        val = samples[i0] * (1 - frac) + samples[i1] * frac
+        new_samples.append(int(val))
+    return struct.pack(f">{len(new_samples)}h", *new_samples)
 
 # ── Audio Output Handler (THREAD SAFE) ────────────────────────
 class AudioOutput:
@@ -171,6 +188,89 @@ class AudioOutput:
         self.stop()
         self.p.terminate()
 
+# ── Hear-Self Monitor ─────────────────────────────────────────
+def monitor_consumer():
+    while monitor_active:
+        try:
+            data = monitor_queue.get(timeout=0.1)
+            with monitor_lock:
+                if monitor_stream:
+                    monitor_stream.write(data)
+        except queue.Empty:
+            continue
+
+def start_monitor(ds_rate):
+    global monitor_active, monitor_p, monitor_stream, monitor_rate, monitor_consumer_thread
+    with monitor_lock:
+        if monitor_stream:
+            return True
+        monitor_p = pyaudio.PyAudio()
+        try:
+            info = monitor_p.get_default_output_device_info()
+            dev_idx = info['index']
+            dev_name = info.get('name', 'Default')
+            dev_default_rate = int(info['defaultSampleRate'])
+
+            try:
+                monitor_stream = monitor_p.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=ds_rate,
+                    output=True,
+                    output_device_index=dev_idx,
+                    frames_per_buffer=1024
+                )
+                monitor_rate = ds_rate
+                print(f"Hear Self opened at {ds_rate}Hz on '{dev_name}'")
+            except Exception:
+                monitor_stream = monitor_p.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=dev_default_rate,
+                    output=True,
+                    output_device_index=dev_idx,
+                    frames_per_buffer=1024
+                )
+                monitor_rate = dev_default_rate
+                print(f"Hear Self opened at {dev_default_rate}Hz on '{dev_name}' (resampling from {ds_rate}Hz)")
+
+            monitor_active = True
+            monitor_consumer_thread = threading.Thread(target=monitor_consumer, daemon=True)
+            monitor_consumer_thread.start()
+            return True
+        except Exception as e:
+            print(f"Hear Self failed: {e}")
+            if monitor_stream:
+                monitor_stream.close()
+                monitor_stream = None
+            monitor_p.terminate()
+            monitor_p = None
+            return False
+
+def stop_monitor():
+    global monitor_active, monitor_p, monitor_stream, monitor_consumer_thread
+    monitor_active = False
+    with monitor_lock:
+        if monitor_stream:
+            try:
+                monitor_stream.stop_stream()
+                monitor_stream.close()
+            except Exception:
+                pass
+            monitor_stream = None
+        if monitor_p:
+            try:
+                monitor_p.terminate()
+            except Exception:
+                pass
+            monitor_p = None
+    monitor_consumer_thread = None
+    while not monitor_queue.empty():
+        try:
+            monitor_queue.get_nowait()
+        except Exception:
+            break
+
 # ── Server management ──────────────────────────────────────────
 def send_settings():
     global server_socket, ds_address, current_sample_rate
@@ -198,29 +298,36 @@ def receive_loop():
 
             ds_address = addr
 
-            # DS requested settings (0x10)
             if packet[0] == 0x10:
                 print(f"DS connected from {addr}. Sending settings...")
                 send_settings()
 
-            # DS sent audio frame (0x20)
             elif packet[0] == 0x20:
                 length = struct.unpack('>H', packet[1:3])[0]
                 if length > 0 and len(packet) >= 3 + length:
                     pcm_data = packet[3:3+length]
-                    
-                    # Compute simple RMS amplitude for visualizer
+
                     if len(pcm_data) >= 2:
                         samples = struct.unpack(f">{len(pcm_data)//2}h", pcm_data)
                         sum_squares = sum(s * s for s in samples)
                         rms = math.sqrt(sum_squares / len(samples)) if samples else 0
-                        current_rms_level = min(rms / 32767.0, 1.0) # Normalize 0.0 to 1.0
+                        current_rms_level = min(rms / 32767.0, 1.0)
 
                     if not audio_active:
                         if audio_output.start(current_sample_rate):
                             audio_active = True
                     if audio_active:
                         audio_output.write(pcm_data)
+
+                    if monitor_active:
+                        try:
+                            out_data = pcm_data
+                            if monitor_rate and monitor_rate != current_sample_rate:
+                                out_data = resample_linear(pcm_data, current_sample_rate, monitor_rate)
+                            monitor_queue.put_nowait(out_data)
+                        except queue.Full:
+                            pass
+
                     last_packet_time = time.time()
 
         except socket.timeout:
@@ -291,22 +398,19 @@ class ServerGUI:
         self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
         tk.Entry(frame_port, textvariable=self.port_var, width=8).pack(side=tk.LEFT, padx=5)
 
-        # Audio Quality Frame
         frame_mode = tk.Frame(root)
         frame_mode.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(frame_mode, text="Audio Quality:").pack(side=tk.LEFT)
         self.mode_var = tk.StringVar(value="Standard (8000 Hz)")
         ttk.Combobox(frame_mode, textvariable=self.mode_var,
-                     values=["Low Quality (4000 Hz)", "Standard (8000 Hz)", "High Quality (16384 Hz)"],
+                     values=["Low Quality (4000 Hz)", "Standard (8000 Hz)", "High Quality (16384 Hz)", "Very High Quality (32000 Hz)"],
                      state="readonly", width=24).pack(side=tk.LEFT, padx=5)
 
-        # Fetch devices for dropdowns
         self.input_devices, self.output_devices = get_audio_devices()
-        
-        # Input Device Selection Frame (For Monitor / Physical Mic)
+
         frame_in = tk.Frame(root)
         frame_in.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(frame_in, text="Monitor Input:").pack(side=tk.LEFT)
+        tk.Label(frame_in, text="Entry Virtual Mic:").pack(side=tk.LEFT)
         self.in_names = [name for idx, name in self.input_devices]
         self.in_var = tk.StringVar()
         self.in_combo = ttk.Combobox(frame_in, textvariable=self.in_var, values=self.in_names, state="readonly", width=30)
@@ -314,16 +418,14 @@ class ServerGUI:
         if self.in_names:
             self.in_combo.current(0)
 
-        # Output Device Selection Frame (Virtual Cable Target)
         frame_out = tk.Frame(root)
         frame_out.pack(fill=tk.X, padx=10, pady=5)
-        tk.Label(frame_out, text="Virtual Cable Out:").pack(side=tk.LEFT)
+        tk.Label(frame_out, text="Output Virtual Mic:").pack(side=tk.LEFT)
         self.out_names = [name for idx, name in self.output_devices]
         self.out_var = tk.StringVar()
         self.out_combo = ttk.Combobox(frame_out, textvariable=self.out_var, values=self.out_names, state="readonly", width=30)
         self.out_combo.pack(side=tk.LEFT, padx=5)
-        
-        # Default Output to CABLE Input if available
+
         default_out_idx = 0
         for idx, name in enumerate(self.out_names):
             if "cable input" in name.lower():
@@ -332,23 +434,20 @@ class ServerGUI:
         if self.out_names:
             self.out_combo.current(default_out_idx)
 
-        # ── Visualizer Canvas ──────────────────────────────────
         vis_frame = tk.Frame(root, bg="#111111", relief=tk.SUNKEN, borderwidth=1)
         vis_frame.pack(fill=tk.X, padx=10, pady=8)
-        
-        tk.Label(vis_frame, text="-- Input Level --", fg="#888888", bg="#111111", font=("Arial", 8)).pack(anchor=tk.W, padx=5, pady=2)
+
+        tk.Label(vis_frame, text="-- DS Input Level --", fg="#888888", bg="#111111", font=("Arial", 8)).pack(anchor=tk.W, padx=5, pady=2)
         self.canvas = tk.Canvas(vis_frame, width=450, height=60, bg="#111111", highlightthickness=0)
         self.canvas.pack(padx=5, pady=2)
 
-        # Buttons Frame
         btn_frame = tk.Frame(root)
         btn_frame.pack(pady=5)
         self.start_btn = tk.Button(btn_frame, text="Start Server", command=self.toggle_server, width=11)
         self.start_btn.pack(side=tk.LEFT, padx=3)
         self.apply_btn = tk.Button(btn_frame, text="Apply", command=self.apply_settings, width=8)
         self.apply_btn.pack(side=tk.LEFT, padx=3)
-        
-        # Hear Yourself Monitor Toggle Button
+
         self.monitor_btn = tk.Button(btn_frame, text="Hear Self: OFF", bg="#ffcccc", command=self.toggle_monitor, width=13)
         self.monitor_btn.pack(side=tk.LEFT, padx=3)
 
@@ -373,7 +472,7 @@ class ServerGUI:
         self.out_names = [name for idx, name in self.output_devices]
         self.in_combo['values'] = self.in_names
         self.out_combo['values'] = self.out_names
-        
+
         if self.in_names and self.in_var.get() not in self.in_names:
             self.in_combo.current(0)
         if self.out_names and self.out_var.get() not in self.out_names:
@@ -406,7 +505,9 @@ class ServerGUI:
                 messagebox.showerror("Invalid Port", "Port must be a number.")
                 return
 
-            if "16384" in self.mode_var.get():
+            if "32000" in self.mode_var.get():
+                current_sample_rate = 32000
+            elif "16384" in self.mode_var.get():
                 current_sample_rate = 16384
             elif "4000" in self.mode_var.get():
                 current_sample_rate = 4000
@@ -427,7 +528,9 @@ class ServerGUI:
             messagebox.showerror("Invalid Port", "Port must be a number.")
             return
 
-        if "16384" in self.mode_var.get():
+        if "32000" in self.mode_var.get():
+            new_rate = 32000
+        elif "16384" in self.mode_var.get():
             new_rate = 16384
         elif "4000" in self.mode_var.get():
             new_rate = 4000
@@ -440,6 +543,11 @@ class ServerGUI:
         device_changed = (audio_output and audio_output.device_index != out_idx)
 
         if rate_changed or device_changed:
+            # ── FIX: restart Hear Self so its stream matches the new DS rate ──
+            was_monitoring = monitor_active
+            if was_monitoring:
+                stop_monitor()
+
             current_sample_rate = new_rate
             if server_running:
                 if audio_output:
@@ -448,6 +556,12 @@ class ServerGUI:
                     audio_output.start(current_sample_rate)
                 if ds_address:
                     send_settings()
+
+            if was_monitoring:
+                if not start_monitor(current_sample_rate):
+                    self.monitor_btn.config(text="Hear Self: OFF", bg="#ffcccc")
+                    messagebox.showerror("Hear Self Error",
+                        "Failed to restart Hear Self at the new sample rate.")
 
         if new_port != current_port:
             current_port = new_port
@@ -461,58 +575,30 @@ class ServerGUI:
     def toggle_monitor(self):
         global monitor_active
         if monitor_active:
-            monitor_active = False
+            stop_monitor()
             self.monitor_btn.config(text="Hear Self: OFF", bg="#ffcccc")
         else:
-            in_idx = self.get_selected_input_index()
-            out_idx = self.get_selected_output_index()
-            if in_idx is None or out_idx is None:
-                messagebox.showerror("Error", "Please select valid input and output devices.")
+            if not server_running:
+                messagebox.showwarning("Server Not Running", "Start the server first so the DS can send audio.")
                 return
-            monitor_active = True
-            self.monitor_btn.config(text="Hear Self: ON", bg="#ccffcc")
-            threading.Thread(target=self.monitor_loop, args=(in_idx, out_idx), daemon=True).start()
-
-    def monitor_loop(self, in_idx, out_idx):
-        global monitor_active
-        p = pyaudio.PyAudio()
-        try:
-            in_stream = p.open(format=pyaudio.paInt16, channels=1, rate=current_sample_rate, input=True, input_device_index=in_idx, frames_per_buffer=512)
-            out_stream = p.open(format=pyaudio.paInt16, channels=1, rate=current_sample_rate, output=True, output_device_index=out_idx, frames_per_buffer=512)
-            while monitor_active:
-                try:
-                    data = in_stream.read(512, exception_on_overflow=False)
-                    out_stream.write(data)
-                except Exception:
-                    break
-            in_stream.stop_stream()
-            in_stream.close()
-            out_stream.stop_stream()
-            out_stream.close()
-        except Exception as e:
-            print(f"Monitor error: {e}")
-            monitor_active = False
-            # Needs to run on main thread to update UI safely
-            self.root.after(0, lambda: self.monitor_btn.config(text="Hear Self: OFF", bg="#ffcccc")) 
-        p.terminate()
+            if start_monitor(current_sample_rate):
+                self.monitor_btn.config(text="Hear Self: ON", bg="#ccffcc")
+            else:
+                messagebox.showerror("Hear Self Error", "Could not open default playback device.\nCheck that your speakers/headphones are connected.")
 
     def update_loop(self):
-        # Update client status text
         if ds_address:
             self.client_status_var.set(f"Client connected: {ds_address[0]}")
         else:
             self.client_status_var.set("No client connected")
 
-        # Draw the real-time sound visualizer level bar
         self.canvas.delete("all")
         width, height = 450, 60
-        
-        # Draw background decibel lines
+
         for y_db in [-10, -20, -40]:
             y_pos = height - ((y_db + 50) / 50.0) * height
             self.canvas.create_line(0, y_pos, width, y_pos, fill="#222222")
 
-        # Draw current live level bar
         bar_width = int(width * current_rms_level)
         self.canvas.create_rectangle(0, 0, bar_width, height, fill="#00ff66", outline="")
 
@@ -521,5 +607,5 @@ class ServerGUI:
 if __name__ == "__main__":
     root = tk.Tk()
     app = ServerGUI(root)
-    root.protocol("WM_DELETE_WINDOW", lambda: (stop_server(), root.destroy()))
+    root.protocol("WM_DELETE_WINDOW", lambda: (stop_monitor(), stop_server(), root.destroy()))
     root.mainloop()
